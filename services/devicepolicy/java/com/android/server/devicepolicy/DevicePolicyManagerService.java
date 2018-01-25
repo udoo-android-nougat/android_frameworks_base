@@ -2259,10 +2259,13 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
                 out.endTag(null, "failed-password-attempts");
             }
 
-            if (policy.mActivePasswordQuality != 0 || policy.mActivePasswordLength != 0
+            // Don't save metrics for FBE devices
+            if (!mInjector.storageManagerIsFileBasedEncryptionEnabled()
+                    && (policy.mActivePasswordQuality != 0 || policy.mActivePasswordLength != 0
                     || policy.mActivePasswordUpperCase != 0 || policy.mActivePasswordLowerCase != 0
                     || policy.mActivePasswordLetters != 0 || policy.mActivePasswordNumeric != 0
-                    || policy.mActivePasswordSymbols != 0 || policy.mActivePasswordNonLetter != 0) {
+                    || policy.mActivePasswordSymbols != 0
+                    || policy.mActivePasswordNonLetter != 0)) {
                 out.startTag(null, "active-password");
                 out.attribute(null, "quality", Integer.toString(policy.mActivePasswordQuality));
                 out.attribute(null, "length", Integer.toString(policy.mActivePasswordLength));
@@ -2355,6 +2358,7 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
         JournaledFile journal = makeJournaledFile(userHandle);
         FileInputStream stream = null;
         File file = journal.chooseForRead();
+        boolean needsRewrite = false;
         try {
             stream = new FileInputStream(file);
             XmlPullParser parser = Xml.newPullParser();
@@ -2437,23 +2441,6 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
                 } else if ("password-owner".equals(tag)) {
                     policy.mPasswordOwner = Integer.parseInt(
                             parser.getAttributeValue(null, "value"));
-                } else if ("active-password".equals(tag)) {
-                    policy.mActivePasswordQuality = Integer.parseInt(
-                            parser.getAttributeValue(null, "quality"));
-                    policy.mActivePasswordLength = Integer.parseInt(
-                            parser.getAttributeValue(null, "length"));
-                    policy.mActivePasswordUpperCase = Integer.parseInt(
-                            parser.getAttributeValue(null, "uppercase"));
-                    policy.mActivePasswordLowerCase = Integer.parseInt(
-                            parser.getAttributeValue(null, "lowercase"));
-                    policy.mActivePasswordLetters = Integer.parseInt(
-                            parser.getAttributeValue(null, "letters"));
-                    policy.mActivePasswordNumeric = Integer.parseInt(
-                            parser.getAttributeValue(null, "numeric"));
-                    policy.mActivePasswordSymbols = Integer.parseInt(
-                            parser.getAttributeValue(null, "symbols"));
-                    policy.mActivePasswordNonLetter = Integer.parseInt(
-                            parser.getAttributeValue(null, "nonletter"));
                 } else if (TAG_ACCEPTED_CA_CERTIFICATES.equals(tag)) {
                     policy.mAcceptedCaCertificates.add(parser.getAttributeValue(null, ATTR_NAME));
                 } else if (TAG_LOCK_TASK_COMPONENTS.equals(tag)) {
@@ -2470,6 +2457,28 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
                     policy.mAdminBroadcastPending = Boolean.toString(true).equals(pending);
                 } else if (TAG_INITIALIZATION_BUNDLE.equals(tag)) {
                     policy.mInitBundle = PersistableBundle.restoreFromXml(parser);
+                } else if ("active-password".equals(tag)) {
+                    if (mInjector.storageManagerIsFileBasedEncryptionEnabled()) {
+                        // Remove this from FBE devices
+                        needsRewrite = true;
+                    } else {
+                        policy.mActivePasswordQuality = Integer.parseInt(
+                            parser.getAttributeValue(null, "quality"));
+                        policy.mActivePasswordLength = Integer.parseInt(
+                                parser.getAttributeValue(null, "length"));
+                        policy.mActivePasswordUpperCase = Integer.parseInt(
+                                parser.getAttributeValue(null, "uppercase"));
+                        policy.mActivePasswordLowerCase = Integer.parseInt(
+                                parser.getAttributeValue(null, "lowercase"));
+                        policy.mActivePasswordLetters = Integer.parseInt(
+                                parser.getAttributeValue(null, "letters"));
+                        policy.mActivePasswordNumeric = Integer.parseInt(
+                                parser.getAttributeValue(null, "numeric"));
+                        policy.mActivePasswordSymbols = Integer.parseInt(
+                                parser.getAttributeValue(null, "symbols"));
+                        policy.mActivePasswordNonLetter = Integer.parseInt(
+                                parser.getAttributeValue(null, "nonletter"));
+                    }
                 } else {
                     Slog.w(LOG_TAG, "Unknown tag: " + tag);
                     XmlUtils.skipCurrentTag(parser);
@@ -2492,29 +2501,9 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
         // Generate a list of admins from the admin map
         policy.mAdminList.addAll(policy.mAdminMap.values());
 
-        // Validate that what we stored for the password quality matches
-        // sufficiently what is currently set.  Note that this is only
-        // a sanity check in case the two get out of sync; this should
-        // never normally happen.
-        final long identity = mInjector.binderClearCallingIdentity();
-        try {
-            int actualPasswordQuality = mLockPatternUtils.getActivePasswordQuality(userHandle);
-            if (actualPasswordQuality < policy.mActivePasswordQuality) {
-                Slog.w(LOG_TAG, "Active password quality 0x"
-                        + Integer.toHexString(policy.mActivePasswordQuality)
-                        + " does not match actual quality 0x"
-                        + Integer.toHexString(actualPasswordQuality));
-                policy.mActivePasswordQuality = DevicePolicyManager.PASSWORD_QUALITY_UNSPECIFIED;
-                policy.mActivePasswordLength = 0;
-                policy.mActivePasswordUpperCase = 0;
-                policy.mActivePasswordLowerCase = 0;
-                policy.mActivePasswordLetters = 0;
-                policy.mActivePasswordNumeric = 0;
-                policy.mActivePasswordSymbols = 0;
-                policy.mActivePasswordNonLetter = 0;
-            }
-        } finally {
-            mInjector.binderRestoreCallingIdentity(identity);
+        // Might need to upgrade the file by rewriting it
+        if (needsRewrite) {
+            saveSettingsLocked(userHandle);
         }
 
         validatePasswordOwnerLocked(policy);
@@ -3740,6 +3729,8 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
 
     private boolean isActivePasswordSufficientForUserLocked(
             DevicePolicyData policy, int userHandle, boolean parent) {
+        enforceUserUnlocked(userHandle, parent);
+
         final int requiredPasswordQuality = getPasswordQuality(null, userHandle, parent);
         if (policy.mActivePasswordQuality < requiredPasswordQuality) {
             return false;
@@ -4686,7 +4677,7 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
         }
     }
 
-    private void wipeDataLocked(boolean wipeExtRequested, String reason) {
+    private void wipeDataNoLock(boolean wipeExtRequested, String reason) {
         if (wipeExtRequested) {
             StorageManager sm = (StorageManager) mContext.getSystemService(
                     Context.STORAGE_SERVICE);
@@ -4706,13 +4697,14 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
         }
         final int userHandle = mInjector.userHandleGetCallingUserId();
         enforceFullCrossUsersPermission(userHandle);
+
+        final String source;
         synchronized (this) {
             // This API can only be called by an active device admin,
             // so try to retrieve it to check that the caller is one.
             final ActiveAdmin admin = getActiveAdminForCallerLocked(null,
                     DeviceAdminInfo.USES_POLICY_WIPE_DATA);
-
-            final String source = admin.info.getComponent().flattenToShortString();
+            source = admin.info.getComponent().flattenToShortString();
 
             long ident = mInjector.binderClearCallingIdentity();
             try {
@@ -4727,39 +4719,44 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
                         manager.wipe();
                     }
                 }
-                boolean wipeExtRequested = (flags & WIPE_EXTERNAL_STORAGE) != 0;
-                wipeDeviceOrUserLocked(wipeExtRequested, userHandle,
-                        "DevicePolicyManager.wipeData() from " + source);
             } finally {
                 mInjector.binderRestoreCallingIdentity(ident);
             }
         }
+        final boolean wipeExtRequested = (flags & WIPE_EXTERNAL_STORAGE) != 0;
+        wipeDeviceNoLock(wipeExtRequested, userHandle,
+                "DevicePolicyManager.wipeData() from " + source);
     }
 
-    private void wipeDeviceOrUserLocked(boolean wipeExtRequested, final int userHandle, String reason) {
-        if (userHandle == UserHandle.USER_SYSTEM) {
-            wipeDataLocked(wipeExtRequested, reason);
-        } else {
-            mHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        IActivityManager am = mInjector.getIActivityManager();
-                        if (am.getCurrentUser().id == userHandle) {
-                            am.switchUser(UserHandle.USER_SYSTEM);
-                        }
+    private void wipeDeviceNoLock(boolean wipeExtRequested, final int userHandle, String reason) {
+        final long ident = mInjector.binderClearCallingIdentity();
+        try {
+            if (userHandle == UserHandle.USER_SYSTEM) {
+                wipeDataNoLock(wipeExtRequested, reason);
+            } else {
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            IActivityManager am = mInjector.getIActivityManager();
+                            if (am.getCurrentUser().id == userHandle) {
+                                am.switchUser(UserHandle.USER_SYSTEM);
+                            }
 
-                        boolean isManagedProfile = isManagedProfile(userHandle);
-                        if (!mUserManager.removeUser(userHandle)) {
-                            Slog.w(LOG_TAG, "Couldn't remove user " + userHandle);
-                        } else if (isManagedProfile) {
-                            sendWipeProfileNotification();
+                            boolean isManagedProfile = isManagedProfile(userHandle);
+                            if (!mUserManager.removeUser(userHandle)) {
+                                Slog.w(LOG_TAG, "Couldn't remove user " + userHandle);
+                            } else if (isManagedProfile) {
+                                sendWipeProfileNotification();
+                            }
+                        } catch (RemoteException re) {
+                            // Shouldn't happen
                         }
-                    } catch (RemoteException re) {
-                        // Shouldn't happen
                     }
-                }
-            });
+                });
+            }
+        } finally {
+            mInjector.binderRestoreCallingIdentity(ident);
         }
     }
 
@@ -4814,40 +4811,66 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
             return;
         }
         enforceFullCrossUsersPermission(userHandle);
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.BIND_DEVICE_ADMIN, null);
+
+        // If the managed profile doesn't have a separate password, set the metrics to default
+        if (isManagedProfile(userHandle) && !isSeparateProfileChallengeEnabled(userHandle)) {
+            quality = DevicePolicyManager.PASSWORD_QUALITY_UNSPECIFIED;
+            length = 0;
+            letters = 0;
+            uppercase = 0;
+            lowercase = 0;
+            numbers = 0;
+            symbols = 0;
+            nonletter = 0;
+        }
+
+        validateQualityConstant(quality);
+        DevicePolicyData policy = getUserData(userHandle);
+        synchronized (this) {
+            policy.mActivePasswordQuality = quality;
+            policy.mActivePasswordLength = length;
+            policy.mActivePasswordLetters = letters;
+            policy.mActivePasswordLowerCase = lowercase;
+            policy.mActivePasswordUpperCase = uppercase;
+            policy.mActivePasswordNumeric = numbers;
+            policy.mActivePasswordSymbols = symbols;
+            policy.mActivePasswordNonLetter = nonletter;
+        }
+    }
+
+    @Override
+    public void reportPasswordChanged(int userId) {
+        if (!mHasFeature) {
+            return;
+        }
+        enforceFullCrossUsersPermission(userId);
 
         // Managed Profile password can only be changed when it has a separate challenge.
-        if (!isSeparateProfileChallengeEnabled(userHandle)) {
-            enforceNotManagedProfile(userHandle, "set the active password");
+        if (!isSeparateProfileChallengeEnabled(userId)) {
+            enforceNotManagedProfile(userId, "set the active password");
         }
 
         mContext.enforceCallingOrSelfPermission(
                 android.Manifest.permission.BIND_DEVICE_ADMIN, null);
-        validateQualityConstant(quality);
 
-        DevicePolicyData policy = getUserData(userHandle);
+        DevicePolicyData policy = getUserData(userId);
 
         long ident = mInjector.binderClearCallingIdentity();
         try {
             synchronized (this) {
-                policy.mActivePasswordQuality = quality;
-                policy.mActivePasswordLength = length;
-                policy.mActivePasswordLetters = letters;
-                policy.mActivePasswordLowerCase = lowercase;
-                policy.mActivePasswordUpperCase = uppercase;
-                policy.mActivePasswordNumeric = numbers;
-                policy.mActivePasswordSymbols = symbols;
-                policy.mActivePasswordNonLetter = nonletter;
                 policy.mFailedPasswordAttempts = 0;
-                saveSettingsLocked(userHandle);
-                updatePasswordExpirationsLocked(userHandle);
-                setExpirationAlarmCheckLocked(mContext, userHandle, /* parent */ false);
+                saveSettingsLocked(userId);
+                updatePasswordExpirationsLocked(userId);
+                setExpirationAlarmCheckLocked(mContext, userId, /* parent */ false);
 
                 // Send a broadcast to each profile using this password as its primary unlock.
                 sendAdminCommandForLockscreenPoliciesLocked(
                         DeviceAdminReceiver.ACTION_PASSWORD_CHANGED,
-                        DeviceAdminInfo.USES_POLICY_LIMIT_PASSWORD, userHandle);
+                        DeviceAdminInfo.USES_POLICY_LIMIT_PASSWORD, userId);
             }
-            removeCaApprovalsIfNeeded(userHandle);
+            removeCaApprovalsIfNeeded(userId);
         } finally {
             mInjector.binderRestoreCallingIdentity(ident);
         }
@@ -4913,7 +4936,7 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
             }
             if (wipeData) {
                 // Call without holding lock.
-                wipeDeviceOrUserLocked(false, identifier,
+                wipeDeviceNoLock(false, identifier,
                         "reportFailedPasswordAttempt()");
             }
         } finally {
@@ -6419,6 +6442,14 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub {
         // want to use the actual "unlocked" state.
         Preconditions.checkState(mUserManager.isUserUnlocked(userId),
                 "User must be running and unlocked");
+    }
+
+    private void enforceUserUnlocked(int userId, boolean parent) {
+        if (parent) {
+            enforceUserUnlocked(getProfileParentId(userId));
+        } else {
+            enforceUserUnlocked(userId);
+        }
     }
 
     private void enforceManageUsers() {
